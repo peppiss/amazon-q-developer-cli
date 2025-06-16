@@ -7,6 +7,7 @@ members = [
     "crates/amzn-qdeveloper-streaming-client",
     "crates/amzn-toolkit-telemetry-client",
     "crates/cli",
+    "crates/api-server",
 ]
 
 [workspace.package]
