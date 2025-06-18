@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use cli::api_client::{Client, StreamingClient};
+use cli::api_client::StreamingClient;
 use cli::database::Database;
 use eyre::Result;
 

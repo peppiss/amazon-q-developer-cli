@@ -1,11 +1,10 @@
 use actix_web::{web, HttpResponse, Responder, get, post};
 use async_stream::stream;
 use cli::api_client::model::{
-    ChatMessage, ChatTriggerType, ConversationState, 
-    EditorState, Origin, UserMessage
+    ChatMessage, ChatResponseStream, ConversationState, UserInputMessage, UserInputMessageContext
 };
-use futures::StreamExt;
-use std::time::Duration;
+
+
 use tracing::{error, info};
 
 use crate::error::ApiError;
@@ -49,26 +48,20 @@ async fn chat(
             let mut code_snippets = Vec::new();
             
             // Process the response stream
-            let mut stream = response.into_stream();
-            while let Some(event) = stream.next().await {
-                match event {
-                    Ok(event) => {
+            let mut response_clone = response;
+            while let Ok(Some(event)) = response_clone.recv().await {
+                {
                         // Process different event types
-                        if let Some(text_event) = event.text_event() {
-                            full_response.push_str(&text_event.text);
-                        } else if let Some(code_event) = event.code_event() {
+                        if let ChatResponseStream::AssistantResponseEvent { content } = event {
+                            full_response.push_str(&content);
+                        } else if let ChatResponseStream::CodeEvent { content } = event {
                             code_snippets.push(crate::models::CodeSnippet {
-                                language: code_event.language.clone().unwrap_or_default(),
-                                code: code_event.code.clone(),
+                                language: "".to_string(), // Default language
+                                code: content,
                             });
                         }
                         // Other event types can be handled here
-                    },
-                    Err(e) => {
-                        error!("Error processing response stream: {:?}", e);
-                        return Err(ApiError::AmazonQApiError(format!("Error processing response: {}", e)));
                     }
-                }
             }
             
             // Add the assistant's response to the conversation
@@ -126,49 +119,43 @@ async fn chat_stream(
             
             // Create a stream that will send chunks as they arrive
             let stream = stream! {
-                let mut stream = response.into_stream();
-                while let Some(event) = stream.next().await {
-                    match event {
-                        Ok(event) => {
-                            // Process different event types
-                            if let Some(text_event) = event.text_event() {
-                                full_response.push_str(&text_event.text);
-                                
-                                yield Ok::<_, actix_web::Error>(web::Bytes::from(
-                                    serde_json::to_string(&ChatStreamChunk {
-                                        conversation_id: conversation_id.clone(),
-                                        chunk_type: ChunkType::Text,
-                                        content: text_event.text.clone(),
-                                        is_final: false,
-                                    }).unwrap()
-                                ));
-                            } else if let Some(code_event) = event.code_event() {
-                                yield Ok::<_, actix_web::Error>(web::Bytes::from(
-                                    serde_json::to_string(&ChatStreamChunk {
-                                        conversation_id: conversation_id.clone(),
-                                        chunk_type: ChunkType::Code,
-                                        content: serde_json::to_string(&crate::models::CodeSnippet {
-                                            language: code_event.language.clone().unwrap_or_default(),
-                                            code: code_event.code.clone(),
-                                        }).unwrap(),
-                                        is_final: false,
-                                    }).unwrap()
-                                ));
-                            }
-                            // Other event types can be handled here
-                        },
-                        Err(e) => {
-                            error!("Error processing response stream: {:?}", e);
-                            yield Ok::<_, actix_web::Error>(web::Bytes::from(
-                                serde_json::to_string(&ChatStreamChunk {
-                                    conversation_id: conversation_id.clone(),
-                                    chunk_type: ChunkType::Error,
-                                    content: format!("Error: {}", e),
-                                    is_final: true,
-                                }).unwrap()
-                            ));
-                            break;
-                        }
+                let mut response_clone = response;
+                while let Ok(Some(event)) = response_clone.recv().await {
+                    // Process different event types
+                    if let ChatResponseStream::AssistantResponseEvent { content } = event {
+                        full_response.push_str(&content);
+                        
+                        yield Ok::<_, actix_web::Error>(web::Bytes::from(
+                            serde_json::to_string(&ChatStreamChunk {
+                                conversation_id: conversation_id.clone(),
+                                chunk_type: ChunkType::Text,
+                                content: content.clone(),
+                                is_final: false,
+                            }).unwrap()
+                        ));
+                    } else if let ChatResponseStream::CodeEvent { content } = event {
+                        yield Ok::<_, actix_web::Error>(web::Bytes::from(
+                            serde_json::to_string(&ChatStreamChunk {
+                                conversation_id: conversation_id.clone(),
+                                chunk_type: ChunkType::Code,
+                                content: serde_json::to_string(&crate::models::CodeSnippet {
+                                    language: "".to_string(), // Default language
+                                    code: content,
+                                }).unwrap(),
+                                is_final: false,
+                            }).unwrap()
+                        ));
+                    } else if let ChatResponseStream::InvalidStateEvent { reason, message } = event {
+                        error!("Invalid state: {} - {}", reason, message);
+                        yield Ok::<_, actix_web::Error>(web::Bytes::from(
+                            serde_json::to_string(&ChatStreamChunk {
+                                conversation_id: conversation_id.clone(),
+                                chunk_type: ChunkType::Error,
+                                content: format!("Error: {}", message),
+                                is_final: true,
+                            }).unwrap()
+                        ));
+                        break;
                     }
                 }
                 
@@ -204,31 +191,78 @@ async fn chat_stream(
 #[get("/conversations")]
 async fn get_conversations(state: web::Data<ServerState>) -> Result<impl Responder, ApiError> {
     let conversations = state.conversations.read().unwrap();
-    let conversations: Vec<_> = conversations.values().cloned().collect();
+    let mut result = Vec::new();
     
-    Ok(HttpResponse::Ok().json(conversations))
+    for (_id, session) in conversations.iter() {
+        result.push(session.clone());
+    }
+    
+    Ok(HttpResponse::Ok().json(result))
 }
 
 /// Create a conversation state from a session
 fn create_conversation_state(session: &crate::models::ConversationSession) -> ConversationState {
-    // Convert the session messages to ChatMessage format
-    let messages: Vec<ChatMessage> = session.messages.iter().map(|msg| {
+    // Get the last user message if available
+    let last_user_message = session.messages.iter()
+        .filter(|msg| msg.role == MessageRole::User)
+        .last();
+    
+    // Create history from previous messages
+    let mut history = Vec::new();
+    
+    // Add message pairs to history
+    let mut user_msg = None;
+    for msg in &session.messages {
         match msg.role {
-            MessageRole::User => ChatMessage::User(UserMessage {
-                content: msg.content.clone(),
-                trigger_type: Some(ChatTriggerType::Manual),
-            }),
-            MessageRole::Assistant => ChatMessage::Assistant(cli::api_client::model::AssistantMessage {
-                content: msg.content.clone(),
-            }),
+            MessageRole::User => {
+                user_msg = Some(msg);
+            },
+            MessageRole::Assistant => {
+                if let Some(user) = user_msg {
+                    // Add user message
+                    history.push(ChatMessage::UserInputMessage(UserInputMessage {
+                        content: user.content.clone(),
+                        user_input_message_context: None,
+                        user_intent: None,
+                        images: None,
+                    }));
+                    
+                    // Add assistant message
+                    history.push(ChatMessage::AssistantResponseMessage(
+                        cli::api_client::model::AssistantResponseMessage {
+                            content: msg.content.clone(),
+                            message_id: None,
+                            tool_uses: None,
+                        }
+                    ));
+                    
+                    user_msg = None;
+                }
+            }
         }
-    }).collect();
+    }
+    
+    // Create user input message from the last user message
+    let user_input_message = if let Some(last_msg) = last_user_message {
+        UserInputMessage {
+            content: last_msg.content.clone(),
+            user_input_message_context: Some(UserInputMessageContext::default()),
+            user_intent: None,
+            images: None,
+        }
+    } else {
+        UserInputMessage {
+            content: String::new(),
+            user_input_message_context: Some(UserInputMessageContext::default()),
+            user_intent: None,
+            images: None,
+        }
+    };
     
     // Create the conversation state
     ConversationState {
-        messages,
-        editor_state: Some(EditorState::default()),
-        source: Some(Origin::Cli),
-        ..Default::default()
+        conversation_id: Some(session.id.clone()),
+        user_input_message,
+        history: Some(history),
     }
 }
